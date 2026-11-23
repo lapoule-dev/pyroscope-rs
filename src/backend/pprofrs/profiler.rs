@@ -173,6 +173,40 @@ fn write_thread_name(current_thread: libc::pthread_t, name: &mut [libc::c_char])
     }
 }
 
+/// The calling thread's `pthread_t`, safe to read from a signal handler that
+/// may run on a thread being born or torn down.
+///
+/// On Apple arm64, `pthread_self()` authenticates the thread's signed
+/// signature and executes `brk` (SIGTRAP, "pointer authentication trap DB")
+/// when it does not check out. SIGPROF lands on whichever thread is on CPU,
+/// including one still in `thread_start` or already past its pthread teardown,
+/// where that signature is not valid, so calling it here kills the process.
+/// Slot 0 of the thread-specific data (`_PTHREAD_TSD_SLOT_PTHREAD_SELF`), whose
+/// base `TPIDRRO_EL0` holds, carries the same `pthread_t` unauthenticated. A
+/// null base or slot yields 0: the sample is kept, without a thread identity.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn signal_safe_thread_self() -> libc::pthread_t {
+    let base: usize;
+    // SAFETY: reading TPIDRRO_EL0 has no side effect and is allowed at EL0.
+    unsafe {
+        std::arch::asm!("mrs {}, tpidrro_el0", out(reg) base, options(nomem, nostack, preserves_flags))
+    };
+    // The low bits held the CPU number on older systems; the base is 8-aligned.
+    let tsd = (base & !7) as *const libc::pthread_t;
+    if tsd.is_null() {
+        return 0;
+    }
+    // SAFETY: a non-null TPIDRRO_EL0 points at the thread's TSD array, which
+    // lives inside the thread's own pthread structure for as long as the
+    // thread can run; slot 0 is the pthread_self slot.
+    unsafe { std::ptr::read_volatile(tsd) }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn signal_safe_thread_self() -> libc::pthread_t {
+    unsafe { libc::pthread_self() }
+}
+
 struct ErrnoProtector(libc::c_int);
 
 impl ErrnoProtector {
@@ -307,7 +341,7 @@ extern "C" fn perf_signal_handler(
                 }
             });
 
-            let current_thread = unsafe { libc::pthread_self() };
+            let current_thread = signal_safe_thread_self();
             let mut name = [0; MAX_THREAD_NAME];
             let name_ptr = &mut name as *mut [libc::c_char] as *mut libc::c_char;
 
